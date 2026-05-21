@@ -15,6 +15,13 @@ def timeit(func):
     return wrapper
 
 
+"""
+Converts continuos 3D coordinates into discrete voxels coordinates
+
+coord = [0.10, 0.20, 0.30]
+voxel_size = 0.05
+coord / voxel_size = [2, 4, 6] rounds to nearest neighbor
+"""
 def quantize(coord: torch.Tensor, voxel_size) -> torch.Tensor:
     # quantize to nearest neighbor
     round_coord = torch.round(coord / voxel_size).cpu()

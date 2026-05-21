@@ -3,7 +3,8 @@ from datasets.cgca_autoencoder_dataset import (
 )
 from datasets.transition_dataset import (
 	TransitionShapenetDataset,
-	TransitionSyntheticRoomDataset
+	TransitionSyntheticRoomDataset,
+    GenerationShapenetDataset
 )
 
 DATASET = {
@@ -12,5 +13,8 @@ DATASET = {
 
 	# transition datasets
 	TransitionShapenetDataset.name: TransitionShapenetDataset,
-	TransitionSyntheticRoomDataset.name: TransitionSyntheticRoomDataset
+	TransitionSyntheticRoomDataset.name: TransitionSyntheticRoomDataset,
+    
+	# Generation datasets
+    GenerationShapenetDataset.name: GenerationShapenetDataset
 }

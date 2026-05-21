@@ -1,0 +1,2 @@
+python3 /home/isipiran/gca_necs/MyScripts/CreateSDF_Dataset.py --class_id 02691156 --class_name airplane
+python3 /home/isipiran/gca_necs/MyScripts/CreateSDF_Dataset.py --class_id 02958343 --class_name car

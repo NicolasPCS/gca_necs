@@ -12,6 +12,5 @@ moviepy
 psutil
 pdbpp
 scikit-learn
-pymcubes
 natsort
 trimesh

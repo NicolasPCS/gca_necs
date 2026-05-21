@@ -6,7 +6,8 @@ from data import DataScheduler
 
 
 def train_model(
-		config, model: TransitionModel,
+		config,
+		model: TransitionModel,
 		scheduler: DataScheduler,
 		writer: SummaryWriter,
 		resume_step: int = 0

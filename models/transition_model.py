@@ -139,4 +139,3 @@ class TransitionModel(Model, ABC):
 
 	def create_meshes(self, *args, **kwargs):
 		raise NotImplementedError()
-

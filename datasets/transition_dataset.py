@@ -287,7 +287,7 @@ class TransitionShapenetDataset(TransitionDataset):
 				testset_dict[sample_num] += [data['surface'][:sample_num]]
 
 		testset_dict = {
-			k: torch.tensor(np.stack(testset_dict[k], axis=0))
+			k: torch.tensor(np.stack(testset_dict[k], axis=0), dtype=torch.float32)
 			for k in testset_dict.keys()
 		}
 		print('Collected {} complete shapes'.format(testset_dict[list(testset_dict.keys())[0]].shape[0]))
@@ -359,6 +359,180 @@ class TransitionShapenetDataset(TransitionDataset):
 			model.scalar_summaries['metrics/uhd-{}'.format(sample_num)] += [uhd]
 			model.list_summaries['metrics/uhd_histogram-{}'.format(sample_num)] += uhds[sample_num]
 			print('mmd-{}: {}\ntmd-{}: {}\nuhd-{}: {}'.format(sample_num, mmd, sample_num, tmd, sample_num, uhd))
+
+		model.write_dict_summaries(step)
+		model.train(training)
+
+
+class GenerationShapenetDataset(TransitionDataset):
+	name = 'gca_generation_shapenet'
+
+	def __init__(self, config: dict, mode: str):
+		TransitionDataset.__init__(self, config, mode)
+		self.obj_class = config['obj_class']
+
+		if mode == 'train':
+			self.data_root = os.path.join(
+				config['data_root'], self.obj_class, 'train'
+			)
+			data_list_file_name = 'train.txt'
+		elif mode == 'val' or mode == 'test':
+			self.data_root = os.path.join(
+				config['data_root'], self.obj_class, 'test'
+			)
+			data_list_file_name = 'test.txt'
+		else:
+			raise ValueError()
+
+		data_list_file_path = os.path.join(
+			config['data_root'], self.obj_class,
+			data_list_file_name
+		)
+		with open(data_list_file_path, 'r') as f:
+			self.data_list = f.read().splitlines()
+		self.data_list = sorted([
+			x[:-1] if x[-1] == '\n' else x
+			for x in self.data_list
+		])
+
+		if (mode == 'val') and (config['eval_size'] is not None):
+			# fix vis_indices
+			eval_size = config['eval_size']
+			if isinstance(eval_size, int):
+				val_indices = torch.linspace(0, len(self.data_list) - 1, eval_size).int().tolist()
+				self.data_list = [self.data_list[i] for i in val_indices]
+
+	@change_feat
+	def __getitem__(self, idx):
+		if self.config['overfit_one_ex'] is not None:
+			idx = self.config['overfit_one_ex']
+		data_name = self.data_list[idx]
+		data_path = os.path.join(self.data_root, data_name + '.npz')
+		with np.load(data_path, 'r') as data:
+			data = dict(data)
+
+		# obtain initial state
+		shape_coord = torch.tensor(data['surface'])
+		
+		# Target: complete voxelized form
+		target_coord = quantize(shape_coord, self.voxel_size)
+
+		if target_coord.shape[0] == 0:
+			raise RuntimeWarning(f"Empty target after quantization: {data_path}")
+
+		# Initializing q0(s0 / x) for generation: one single occupied cell belonging to x
+		rand_idx = torch.randint(target_coord.shape[0], (1,)).item()
+		state_coord = target_coord[rand_idx:rand_idx+1].int()
+
+		# Features
+		# For gca model, the decorator @change_feat will convert it to ones(N, 1)
+		state_feat = torch.ones(state_coord.shape[0], 1).float()
+
+		# The gca model expects embedding_coord as tardet. Here we use the complete occupation.
+		embedding_coord = target_coord.int()
+		embedding_feat = torch.ones(embedding_coord.shape[0], 1).float() 
+
+		return {
+			'input_pc': state_coord.float() / self.config['voxel_size'],  # used for condition model
+			'state0_coord': None,  # used for condition model
+			'state0_feat': None,  # used for condition model
+			'state_coord': state_coord,
+			'state_feat': state_feat,
+			'embedding_coord': embedding_coord,
+			'embedding_feat': embedding_feat,
+			'file_name': data_name,
+			'phase': Phase(
+				self.config['max_phase'],
+				self.config['equilibrium_max_phase']
+			)
+		}
+
+	def test(self, model: TransitionModel, writer: SummaryWriter, step):
+		training = model.training
+		model.eval()
+
+		# collect testset
+		test_sample_nums = self.config['test_sample_nums']  # list
+		testset_dict = defaultdict(list)
+		
+		print('Collecting testsets...')
+		for file_name in tqdm(self.data_list):
+			data_path = os.path.join(self.data_root, file_name + '.npz')
+			with np.load(data_path, 'r') as data:
+				data = dict(data)
+				
+			for sample_num in test_sample_nums:
+				testset_dict[sample_num] += [data['surface'][:sample_num]]
+
+		testset_dict = {
+			k: torch.tensor(np.stack(testset_dict[k], axis=0), dtype=torch.float32)
+			for k in testset_dict.keys()
+		}
+		print('Collected {} complete shapes'.format(testset_dict[list(testset_dict.keys())[0]].shape[0]))
+
+		data_loader = DataLoader(
+			self,
+			batch_size=self.config['test_batch_size'],
+			num_workers=self.config['num_workers'],
+			collate_fn=self.collate_fn,
+			drop_last=False,
+			shuffle=False
+		)
+
+		tmds = defaultdict(list)
+		uhds = defaultdict(list)
+		mmd_calculator = {k: MMDCalculator(testset_dict[k]) for k in testset_dict.keys()}
+		for test_step, data in tqdm(enumerate(data_loader)):
+			batch_size = len(data['state_feat'])
+			self.cache(model, data, data['file_name'], step)  # cache sparse voxel embedding
+			torch.cuda.empty_cache()  # saves memory
+			cache_dicts = model.load_cache(step, data['file_name'])
+			final_pc_dict = defaultdict(list)
+			for trial, cache_dicts_single_trial in enumerate(cache_dicts):
+				s = model.cache_dicts2sparse_tensor(cache_dicts_single_trial)
+				s_pc_dict, mesh_dict = model.get_pointcloud(s, test_sample_nums, return_mesh=True)
+				for sample_num in test_sample_nums:
+					final_pc_dict[sample_num].append(s_pc_dict[sample_num])
+
+				mesh_save_dir = os.path.join(
+					self.config['log_dir'], 'test_save',
+					'step-{}'.format(step), 'mesh'
+				)
+				for k, meshes in mesh_dict.items():
+					for batch_idx, mesh in enumerate(meshes):
+						file_name = data['file_name'][batch_idx]
+						os.makedirs(os.path.join(mesh_save_dir, k), exist_ok=True)
+						mesh.export(os.path.join(mesh_save_dir, k, '{}_{}.obj'.format(file_name, trial)))
+
+			# convert trials x batch_size -> batch_size x trials
+			final_pc_dict = {k: list(zip(*final_pc_dict[k])) for k in final_pc_dict.keys()}  # change to B x trials
+			
+			for sample_num in test_sample_nums:
+				for batch_idx in range(batch_size):
+					try:
+						pred_coords_down = torch.stack(final_pc_dict[sample_num][batch_idx], dim=0).to(self.device)
+					except:
+						breakpoint()
+					tmds[sample_num] += [mutual_difference(pred_coords_down)]
+					mmd_calculator[sample_num].add_generated_set(pred_coords_down)
+			torch.cuda.empty_cache()
+
+			cache_dir = os.path.join(
+				self.config['log_dir'], 'test_save',
+				'step-{}'.format(step), 'cache'
+			)
+			shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+		# write to tensorboard
+		for sample_num in test_sample_nums:
+			mmd = mmd_calculator[sample_num].calculate_mmd()
+			tmd = np.array(tmds[sample_num]).mean()
+			model.scalar_summaries['metrics/mmd-{}'.format(sample_num)] += [mmd]
+			model.list_summaries['metrics/mmd_historgram-{}'.format(sample_num)] += mmd_calculator[sample_num].dists
+			model.scalar_summaries['metrics/tmd-{}'.format(sample_num)] += [tmd]
+			model.list_summaries['metrics/tmd_historgram-{}'.format(sample_num)] += tmds[sample_num]
+			print('mmd-{}: {}\ntmd-{}: {}'.format(sample_num, mmd, sample_num, tmd))
 
 		model.write_dict_summaries(step)
 		model.train(training)
