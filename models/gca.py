@@ -164,14 +164,16 @@ class GCA(TransitionModel):
 		# if the sampled output contains no coords
 		batch_size = s.C[:, 0].max().item() + 1
 		for batch_idx in range(batch_size):
-			if (s_next_coord[:, 0] == batch_idx).shape[0] == 0:
-				if s_next_coord[:, 0].shape[0] == 0:
-					s_next_coord = torch.zeros(1, 4).int().to(s_next_coord.device)
+			if (s_next_coord[:, 0] == batch_idx).sum().item() == 0:
+				fallback_coord = torch.tensor(
+					[[batch_idx] + [0, ] * self.config['data_dim']],
+					dtype=s_next_coord.dtype,
+					device=s_next_coord.device
+				)
+				if s_next_coord.shape[0] == 0:
+					s_next_coord = fallback_coord
 				else:
-					s_next_coord = torch.stack([
-						s_next_coord,
-						torch.tensor([[batch_idx] + [0, ] * self.config['data_dim']]).int().to(s_next_coord.device)
-					], dim=0)
+					s_next_coord = torch.cat([s_next_coord, fallback_coord], dim=0)
 		
 		if (self.symmetry_config['enabled'] and self.symmetry_config['enforce_sampling'] and self.symmetry_config['enforce_sampling_mode'] == 'each_step'):
 			s_next_coord, _ = make_symmetric_sparse_coords(s_next_coord, axis=self.symmetry_config['axis'],

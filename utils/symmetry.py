@@ -56,10 +56,10 @@ def detect_spatial_coordinate_columns(coords: torch.Tensor, data_dim: int = 3, c
             raise ValueError('Cannot infer layout from coords shape {} with data_dim={}'.format(tuple(coords.shape), data_dim))
     
     if coordinate_layout == 'batched':
-        print(f"coordinate_layout = {coordinate_layout}. return: {tuple(range(1, data_dim + 1))}")
+        #print(f"coordinate_layout = {coordinate_layout}. return: {tuple(range(1, data_dim + 1))}")
         return tuple(range(1, data_dim + 1))
     if coordinate_layout == 'spatial':
-        print(f"coordinate_layout = {coordinate_layout}. return: {tuple(range(data_dim))}")
+        #print(f"coordinate_layout = {coordinate_layout}. return: {tuple(range(data_dim))}")
         return tuple(range(data_dim))
     raise ValueError("Unknown coordinate_layout {}".format(coordinate_layout))
 
@@ -70,7 +70,7 @@ def _axis_column(coords: torch.Tensor, axis='x', data_dim: int = 3, coordinate_l
     spatial_columns = detect_spatial_coordinate_columns(coords, data_dim, coordinate_layout)
     if axis_index >= len(spatial_columns):
         raise ValueError('axis {} is invalid fpr data_dim={}'.format(axis, data_dim))
-    print(f"spatial_columns = {spatial_columns}. axis_index = {axis_index}")
+    #print(f"spatial_columns = {spatial_columns}. axis_index = {axis_index}")
     return spatial_columns[axis_index]
 
 def reflect_coords(coords: torch.Tensor, axis='x', plane_value=0, coordinate_layout: str = 'auto', data_dim: int =3) -> torch.Tensor:

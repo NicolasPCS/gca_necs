@@ -3,6 +3,7 @@ import os
 import sys
 import torch
 import yaml
+import numpy as np
 
 # Agregar la raíz del proyecto al sys.path para evitar ModuleNotFoundError
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,8 +28,8 @@ def create_single_voxel_seed(in_channels: int, device: torch.device) -> ME.Spars
 
 def main():
     # 1. Definir rutas base
-    config_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_30/config.yaml"
-    checkpoint_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_30/ckpts/ckpt-step-200000"
+    config_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_symmetry/config.yaml"
+    checkpoint_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_symmetry/ckpts/ckpt-step-150000"
     output_dir = os.path.join(os.path.dirname(config_path), "generated_objs_from_single_seed")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -72,9 +73,18 @@ def main():
                     break
 
             print("Extrayendo nube de puntos y generando malla final...")
-            s_pc_dict, mesh_dict = model.get_pointcloud(s, test_sample_nums, return_mesh=True)
+            s_pc_dict, mesh_dict = model.get_pointcloud(s, test_sample_nums, return_mesh=True) # test_sample_nums = [2048, 16384]
 
-            # 5. Exportar mallas resultantes
+            # 5. Exportar nubes de puntos y mallas resultantes
+            # NOTE: [Review] Changes from codex
+            for sample_num, pointclouds in s_pc_dict.items():
+                for batch_idx, pointcloud in enumerate(pointclouds):
+                    pc_np = pointcloud.detach().cpu().numpy()
+                    npy_name = f"generated_trial{trial}_points{sample_num}_{batch_idx}.npy"
+                    npy_path = os.path.join(output_dir, npy_name)
+                    np.save(npy_path, pc_np)
+                    print(f"Nube de puntos guardada en: {npy_path}")
+
             for k, meshes in mesh_dict.items():
                 for batch_idx, mesh in enumerate(meshes):
                     file_name = f"generated_trial{trial}_{k}_{batch_idx}.obj"
