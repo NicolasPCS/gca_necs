@@ -28,8 +28,8 @@ def create_single_voxel_seed(in_channels: int, device: torch.device) -> ME.Spars
 
 def main():
     # 1. Definir rutas base
-    config_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_symmetry/config.yaml"
-    checkpoint_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_symmetry/ckpts/ckpt-step-150000"
+    config_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_symmetry_rulebased/config.yaml"
+    checkpoint_path = "/home/isipiran/gca_necs/log/gca_generation_airplane_symmetry_rulebased/ckpts/ckpt-step-145000"
     output_dir = os.path.join(os.path.dirname(config_path), "generated_objs_from_single_seed")
     os.makedirs(output_dir, exist_ok=True)
 

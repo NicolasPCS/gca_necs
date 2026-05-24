@@ -24,8 +24,6 @@ from utils.metrics import (
 from utils.visualization import (
 	sparse_tensors2tensor_imgs, save_tensor_img, tensors2tensor_imgs
 )
-from utils.symmetry import *
-
 
 def change_feat(f):
 	def wrapper(*args):
@@ -47,7 +45,6 @@ class TransitionDataset(BaseDataset):
 		self.data_list = []
 
 	def cache(self, model, data, rel_file_names, step):
-		symmetry_config = get_symmetry_config(self.config)
 		batch_size = len(data['state_feat'])
 		s_init = SparseTensor(
 			features=torch.cat(data['state_feat']),
@@ -90,30 +87,6 @@ class TransitionDataset(BaseDataset):
 					s_next = model.transition(s, sigma)
 				s = s_next
 				phase += 1
-
-			if (symmetry_config['enabled'] and symmetry_config['enforce_sampling'] and symmetry_config['enforce_sampling_mode'] == 'final'):
-				# Hard symmetry
-				sym_coords, sym_feats = make_symmetric_sparse_coords(s.C, # generated active voxels 
-														 			 s.F, # voxel features
-														 			 axis=symmetry_config['axis'],
-														 			 plane_value=symmetry_config['plane_value'],
-																	 merge_features=symmetry_config['merge_features'],
-																	 coordinate_layout='batched',
-																	 data_dim=self.config['data_dim'])
-				s = SparseTensor(features=sym_feats, coordinates=sym_coords, device=self.device)
-			
-			if symmetry_config['enabled'] and symmetry_config['debug']:
-				print(
-					'symmetry_error/final={:.6f}'.format(
-						symmetry_error(
-							s.C,
-							axis=symmetry_config['axis'],
-							plane_value=symmetry_config['plane_value'],
-							coordinate_layout='batched',
-							data_dim=self.config['data_dim'],
-						)
-					)
-				)
 
 			out_imgs = sparse_tensors2tensor_imgs(
 				s, self.config['data_dim'],

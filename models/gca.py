@@ -13,7 +13,7 @@ from utils.visualization import (
 	vis_2d_coords, tensors2dist_func_tensor_imgs, tensors2tensor_imgs
 )
 from utils.marching_cube import marching_cubes_sparse_voxel
-from utils.symmetry import *
+from utils.symmetry_rules import *
 
 class GCA(TransitionModel):
 	name = 'gca'
@@ -22,7 +22,7 @@ class GCA(TransitionModel):
 		TransitionModel.__init__(self, config, writer)
 		self.infusion_scheduler = InfusionScheduler(config)
 		self.bce_loss = torch.nn.BCEWithLogitsLoss()
-		self.symmetry_config = get_symmetry_config(config)
+		self.symmetry_rules_config = get_symmetry_rules_config(config)
 
 	@timeit
 	def forward(self, x):
@@ -120,24 +120,20 @@ class GCA(TransitionModel):
 				self.scalar_summaries[incomplete_key] = [self.scalar_summaries[incomplete_key][0] + 1] if \
 					len(self.scalar_summaries[incomplete_key]) != 0 else [1]
 
+		# NOTE: Symmetry rule during training
+		if self.symmetry_rules_config['enabled'] and self.symmetry_rules_config['apply_during_training']:
+			# Convert per item unbatched coords [Ni, 3] to one batched tensor [N, 4].
+			s_next_batched = ME.utils.batched_coordinates(s_next_coords).to(self.device)
+			batch_specs = batch_specs_from_config(self.config, batch_size, data=data)
+			s_next_batched, _ = apply_symmetry_rule_to_batched_state(s_next_batched, feats=None, batch_specs=batch_specs, data_dim=self.config['data_dim'])
+			s_next_coords = [s_next_batched[s_next_batched[:, 0] == batch_idx, 1:].detach().cpu()
+							 for batch_idx in range(batch_size)] 
+
 		loss = torch.stack(losses).mean()
-
-		symmetry_loss = None
-		if (self.symmetry_config['enabled'] and self.symmetry_config['train_loss_weight'] > 0 and self.symmetry_config['train_loss_type'] in ['occupancy', 'both']):
-			symmetry_loss = compute_symmetry_occupancy_loss(s_hat.C, # Coordinates 
-												   			s_hat.F[:, 0], # Ocupation logits
-												   			axis=self.symmetry_config['axis'],
-															plane_value=self.symmetry_config['plane_value'],
-															coordinate_layout='batched',
-															data_dim=self.config['data_dim'])
-			loss = loss + (self.symmetry_config['train_loss_weight'] * symmetry_loss)
-
 		data['state_coord'] = s_next_coords
 
 		# write summaries
 		self.scalar_summaries['loss/{}/total'.format(mode)] += [loss.item()]
-		if symmetry_loss is not None:
-			self.scalar_summaries['loss/{}/symmetry'.format(mode)] += [symmetry_loss.detach().cpu().item()]
 		self.list_summaries['loss/{}/total_histogram'.format(mode)] += torch.stack(losses).cpu().tolist()
 		self.scalar_summaries['num_points/input'] += [(s.C[:, 0] == i).sum().item() for i in range(batch_size)]
 		self.scalar_summaries['num_points/output'] += [one_hot_gt[i].shape[0] for i in range(batch_size)]
@@ -156,10 +152,11 @@ class GCA(TransitionModel):
 		return loss.detach().cpu().item(), data
 
 	def transition(self, s: SparseTensor, sigma=None) -> SparseTensor:
-		y_hat = self.forward(s)
-		feat_sample = self.sample_feat(y_hat.F)
-		s_next_coord = y_hat.C[feat_sample.bool(), :]
-		s_next_feat = None
+		# NOTE: Rule of the original 
+		# NOTE: s_t -> red GCA -> probabilidades/logits -> sampleo -> s_{t+1}
+		y_hat = self.forward(s) # Apply the sparse net over the local neighbor. The net learns the transition rule
+		feat_sample = self.sample_feat(y_hat.F) # Converts logits into activations using bernouli
+		s_next_coord = y_hat.C[feat_sample.bool(), :] # Selects the active voxels of the next state
 
 		# if the sampled output contains no coords
 		batch_size = s.C[:, 0].max().item() + 1
@@ -175,15 +172,13 @@ class GCA(TransitionModel):
 				else:
 					s_next_coord = torch.cat([s_next_coord, fallback_coord], dim=0)
 		
-		if (self.symmetry_config['enabled'] and self.symmetry_config['enforce_sampling'] and self.symmetry_config['enforce_sampling_mode'] == 'each_step'):
-			s_next_coord, _ = make_symmetric_sparse_coords(s_next_coord, axis=self.symmetry_config['axis'],
-												  		   plane_value=self.symmetry_config['plane_value'],
-														   merge_features=self.symmetry_config['merge_features'],
-														   coordinate_layout='batched',
-														   data_dim=self.config['data_dim'])
+		# NOTE: Symmetry rule during sampling
+		if self.symmetry_rules_config['enabled'] and self.symmetry_rules_config['apply_during_sampling']:
+			batch_size = s.C[:, 0].max().item() + 1
+			batch_specs = batch_specs_from_config(self.config, batch_size)
+			s_next_coord, _ = apply_symmetry_rule_to_batched_state(s_next_coord, feats=None, batch_specs=batch_specs, data_dim=self.config['data_dim'])
 
-		if s_next_feat is None:
-			s_next_feat = torch.ones(s_next_coord.shape[0], 1)
+		s_next_feat = torch.ones(s_next_coord.shape[0], 1)
 		try:
 			s_next = SparseTensor(
 				s_next_feat, s_next_coord,
