@@ -1,35 +1,72 @@
+import argparse
 import os
 import sys
-import yaml
-import torch
+
 import numpy as np
+import torch
+import yaml
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import MODEL
-import MinkowskiEngine as ME  # type: ignore
-from MinkowskiEngine.utils import sparse_quantize  # type: ignore
+import MinkowskiEngine as ME  # type: ignore  # noqa: E402
+from MinkowskiEngine.utils import sparse_quantize  # type: ignore  # noqa: E402
+from models import MODEL  # noqa: E402
 
 
-config_path = "/home/isipiran/gca_necs/log/05-15-23:59:44/config.yaml"
-checkpoint_path = "/home/isipiran/gca_necs/log/05-15-23:59:44/ckpts/ckpt-step-492000"
-
-# CAMBIO: path del objeto .npz
-npz_path = "/home/isipiran/gca_necs/data/shapenet_sdf/chair/test/cbe006da89cca7ffd6bab114dd47e3f.npz"
-
-config = yaml.load(open(config_path), Loader=yaml.FullLoader)
-model = MODEL[config['model']](config, writer=None)
-
-device = config['device']
-checkpoint = torch.load(checkpoint_path, map_location=device)
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-model.to(device)
-
-num_trials = 1
-num_steps = config.get("max_eval_phase", config.get("max_phase", 30))
-test_sample_nums = config.get('test_sample_nums', [2048])
-in_channels = config["backbone"].get("in_channels", 1)
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate GCA samples from partial ShapeNet objects stored as .npz files."
+    )
+    parser.add_argument(
+        "--config",
+        default="/home/isipiran/gca_necs/log/05-15-23:59:44/config.yaml",
+        help="Path to the experiment config.yaml.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="/home/isipiran/gca_necs/log/05-15-23:59:44/ckpts/ckpt-step-492000",
+        help="Path to the checkpoint file.",
+    )
+    parser.add_argument(
+        "--input-dir",
+        default="/home/isipiran/gca_necs/data/shapenet_sdf/chair/test",
+        help="Directory containing ShapeNet .npz files with a 'surface' array.",
+    )
+    parser.add_argument(
+        "--output-subdir",
+        default="generated_pcs_derived_from_shape",
+        help="Output folder name created next to the config file.",
+    )
+    parser.add_argument(
+        "--num-objects",
+        type=int,
+        default=None,
+        help="Maximum number of .npz shapes to process. Default: all files in input-dir.",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Number of CA transition steps. Default: config max_eval_phase or max_phase.",
+    )
+    parser.add_argument(
+        "--num-points",
+        type=int,
+        default=2048,
+        help="Number of points to sample from the final generated shape.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed used for partial seed creation and point sampling.",
+    )
+    parser.add_argument(
+        "--save-intermediate",
+        action="store_true",
+        help="Save sparse voxels and meshes for intermediate CA steps. Disabled by default.",
+    )
+    return parser.parse_args()
 
 
 def quantize(coord, voxel_size):
@@ -44,8 +81,11 @@ def downsample(coord, n):
     return coord[idx]
 
 
-def create_sphere_seed(npz_path):
+def create_sphere_seed(npz_path, config, in_channels, device):
     data = np.load(npz_path)
+    if "surface" not in data:
+        raise KeyError(f"File {npz_path} does not contain a 'surface' array")
+
     shape_coord = torch.tensor(data["surface"]).float()
 
     max_sphere_centers = config["max_sphere_centers"]
@@ -68,82 +108,124 @@ def create_sphere_seed(npz_path):
 
     point_coord = shape_coord[survived_idxs, :]
     point_coord = downsample(point_coord, surface_cnt)
-
     state_coord = quantize(point_coord, config["voxel_size"])
 
     batch = torch.zeros((state_coord.shape[0], 1), dtype=torch.int32)
     coords = torch.cat([batch, state_coord], dim=1).int()
-
     feats = torch.ones((coords.shape[0], in_channels), dtype=torch.float32)
 
-    s_inicial = ME.SparseTensor(
-        features=feats,
-        coordinates=coords,
-        device=device
-    )
+    return ME.SparseTensor(features=feats, coordinates=coords, device=device)
 
-    return s_inicial
 
-def save_intermediate_step(s, trial, step, output_path):
-    step_dir = os.path.join(output_path, f"trial_{trial}")
+def extract_pointcloud(model, sparse_state, num_points):
+    pointcloud = model.get_pointcloud(sparse_state, [num_points], return_mesh=False)
+    if isinstance(pointcloud, dict):
+        pointcloud = pointcloud[num_points][0]
+    elif isinstance(pointcloud, (list, tuple)):
+        pointcloud = pointcloud[0]
+    if not isinstance(pointcloud, torch.Tensor):
+        pointcloud = torch.tensor(pointcloud)
+
+    pointcloud_np = pointcloud.detach().cpu().numpy().astype(np.float32)
+    if pointcloud_np.shape != (num_points, 3):
+        raise ValueError(f"Expected point cloud shape ({num_points}, 3), got {pointcloud_np.shape}")
+    return pointcloud_np
+
+
+def save_intermediate_step(model, s, sample_nums, object_idx, step, output_path):
+    step_dir = os.path.join(output_path, "intermediate_steps", f"object_{object_idx:04d}")
     os.makedirs(step_dir, exist_ok=True)
 
-    # guarda voxeles sparse
     np.savez_compressed(
         os.path.join(step_dir, f"step_{step:03d}_voxels.npz"),
         coords=s.C.cpu().numpy(),
-        feats=s.F.cpu().numpy()
+        feats=s.F.cpu().numpy(),
     )
 
-    # guarda mesh
     try:
-        _, mesh_dict = model.get_pointcloud(
-            s,
-            test_sample_nums,
-            return_mesh=True
-        )
-
-        for k, meshes in mesh_dict.items():
+        _, mesh_dict = model.get_pointcloud(s, sample_nums, return_mesh=True)
+        for mesh_key, meshes in mesh_dict.items():
             for batch_idx, mesh in enumerate(meshes):
                 file_path = os.path.join(
                     step_dir,
-                    f"step_{step:03d}_{k}_{batch_idx}.obj"
+                    f"step_{step:03d}_{mesh_key}_{batch_idx}.obj",
                 )
                 mesh.export(file_path)
+    except Exception as exc:
+        print(f"  [WARNING] could not save mesh at step {step}: {exc}")
 
-    except Exception as e:
-        print(f"  [WARNING] no se pudo guardar mesh en step {step}: {e}")
 
-output_path = os.path.join(
-    os.path.dirname(config_path),
-    "generated_objs_from_sphere_seed"
-)
-os.makedirs(output_path, exist_ok=True)
+def main():
+    args = parse_args()
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-print("Generating...")
+    config = yaml.load(open(args.config), Loader=yaml.FullLoader)
+    device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
-with torch.no_grad():
+    model = MODEL[config["model"]](config, writer=None)
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    model.to(device)
 
-    for trial in range(num_trials):
-        print(f"\nTrial {trial}")
+    num_steps = args.num_steps if args.num_steps is not None else config.get("max_eval_phase", config.get("max_phase", 30))
+    in_channels = config["backbone"].get("in_channels", 1)
+    voxel_overflow_limit = config.get("voxel_overflow", 20000)
+    sample_nums = [args.num_points]
 
-        s = create_sphere_seed(npz_path)
+    output_path = os.path.join(os.path.dirname(args.config), args.output_subdir)
+    os.makedirs(output_path, exist_ok=True)
 
-        # guardar estado inicial
-        print(f"    step 00: {s.C.shape[0]} voxels")
-        save_intermediate_step(s, trial, 0, output_path)
+    npz_files = sorted(
+        os.path.join(args.input_dir, filename)
+        for filename in os.listdir(args.input_dir)
+        if filename.endswith(".npz")
+    )
+    if args.num_objects is not None:
+        npz_files = npz_files[:args.num_objects]
+    if len(npz_files) == 0:
+        raise RuntimeError(f"No .npz files found in {args.input_dir}")
 
-        for t in range(num_steps):
-            s = model.transition(s)
+    print("Generating from partial ShapeNet seeds...")
+    print(f"  config: {args.config}")
+    print(f"  checkpoint: {args.checkpoint}")
+    print(f"  input_dir: {args.input_dir}")
+    print(f"  output_path: {output_path}")
+    print(f"  num_shapes: {len(npz_files)}")
+    print(f"  save_intermediate: {args.save_intermediate}")
 
-            n_voxels = s.C.shape[0]
-            print(f"    step {t + 1:02d}: {n_voxels} voxels")
+    with torch.no_grad():
+        for object_idx, npz_path in enumerate(npz_files):
+            shape_id = os.path.splitext(os.path.basename(npz_path))[0]
+            print(f"\nObject {object_idx:04d}: {shape_id}")
 
-            # guardar cada paso intermedio
-            save_intermediate_step(s, trial, t + 1, output_path)
+            s = create_sphere_seed(npz_path, config, in_channels, device)
+            print(f"    step 00: {s.C.shape[0]} voxels")
+            if args.save_intermediate:
+                save_intermediate_step(model, s, sample_nums, object_idx, 0, output_path)
 
-            if n_voxels > config.get("voxel_overflow", 20000):
-                print(f"  [WARNING] voxel overflow: {n_voxels}")
-                break
+            for step_idx in range(num_steps):
+                s = model.transition(s)
+                n_voxels = s.C.shape[0]
+                print(f"    step {step_idx + 1:02d}: {n_voxels} voxels")
 
-        print("Done!")
+                if args.save_intermediate:
+                    save_intermediate_step(model, s, sample_nums, object_idx, step_idx + 1, output_path)
+
+                if n_voxels > voxel_overflow_limit:
+                    print(f"  [WARNING] voxel overflow: {n_voxels}")
+                    break
+
+            pointcloud = extract_pointcloud(model, s, args.num_points)
+            pc_path = os.path.join(output_path, f"generated_object_{object_idx:04d}_{shape_id}.npy")
+            np.save(pc_path, pointcloud)
+
+    print("\nDone.")
+    print(f"Point clouds saved in: {output_path}")
+
+
+if __name__ == "__main__":
+    main()

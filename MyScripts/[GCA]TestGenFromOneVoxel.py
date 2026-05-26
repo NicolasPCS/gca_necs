@@ -62,6 +62,10 @@ def extract_2048_pointcloud(model, sparse_state: ME.SparseTensor) -> np.ndarray:
     for batch size 1. The returned NumPy array has shape [2048, 3].
     """
     pointcloud = model.get_pointcloud(sparse_state, [2048], return_mesh=False)
+    if isinstance(pointcloud, dict):
+        pointcloud = pointcloud[2048][0]
+    elif isinstance(pointcloud, (list, tuple)):
+        pointcloud = pointcloud[0]
     if not isinstance(pointcloud, torch.Tensor):
         pointcloud = torch.tensor(pointcloud)
     pointcloud_np = pointcloud.detach().cpu().numpy().astype(np.float32)
@@ -90,7 +94,12 @@ def parse_args():
     parser.add_argument("--trials-per-object", type=int, default=10)
     parser.add_argument("--num-steps", type=int, default=30)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--output-subdir", default="generated_pcs")
+    parser.add_argument(
+        "--use-trials",
+        action="store_true",
+        help="Enable trial-based generation and keep the point cloud with lowest symmetry Chamfer. Disabled by default.",
+    )
+    parser.add_argument("--output-subdir", default=None)
     return parser.parse_args()
 
 
@@ -103,6 +112,8 @@ def main():
 
     config = yaml.load(open(args.config), Loader=yaml.FullLoader)
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    if args.output_subdir is None:
+        args.output_subdir = "generated_pcs" if args.use_trials else "generated_pcs_notrials"
     output_dir = os.path.join(os.path.dirname(args.config), args.output_subdir)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -121,10 +132,31 @@ def main():
     in_channels = config["backbone"].get("in_channels", 1)
     voxel_overflow_limit = config.get("voxel_overflow", 20000)
 
+    if not args.use_trials:
+        print(f"Generating {args.num_objects} objects without trials.")
+
+        with torch.no_grad():
+            for object_idx in range(args.num_objects):
+                print(f"\n=== Object {object_idx:04d} ===")
+                sparse_state = run_ca_generation(
+                    model=model,
+                    in_channels=in_channels,
+                    device=device,
+                    num_steps=num_steps,
+                    voxel_overflow_limit=voxel_overflow_limit,
+                )
+                pointcloud = extract_2048_pointcloud(model, sparse_state)
+                pc_name = f"generated_object_{object_idx:04d}.npy"
+                pc_path = os.path.join(output_dir, pc_name)
+                np.save(pc_path, pointcloud)
+
+        print("\nDone.")
+        print(f"Point clouds saved in: {output_dir}")
+        return
+
     chamfer_scores = np.full((args.num_objects, args.trials_per_object), np.nan, dtype=np.float64)
     best_chamfers = np.full(args.num_objects, np.nan, dtype=np.float64)
     best_trial_indices = np.full(args.num_objects, -1, dtype=np.int64)
-    summary_rows: List[Dict[str, float]] = []
 
     print(
         f"Generating {args.num_objects} objects with "
