@@ -18,8 +18,8 @@ from utils.util import quantize
 # Paths
 # =========================
 
-config_path = "/home/isipiran/gca_necs/log/05-15-23:59:44/config.yaml"
-checkpoint_path = "/home/isipiran/gca_necs/log/05-15-23:59:44/ckpts/ckpt-step-492000"
+config_path = "/home/isipiran/gca_necs/log/gca_chair/config.yaml"
+checkpoint_path = "/home/isipiran/gca_necs/log/gca_chair/ckpts/ckpt-step-300000"
 
 # Cambia este ID por un archivo real de tu test set
 class_name = "chair"
@@ -53,15 +53,18 @@ model.eval()
 # Parameters
 # =========================
 
-num_trials = 5
+num_trials = 2
 num_steps = config.get("max_eval_phase", config.get("max_phase", 30))
 test_sample_nums = config.get("test_sample_nums", [2048])
 voxel_size = config["voxel_size"]
 in_channels = config["backbone"].get("in_channels", 1)
+partial_screenshot = True
+save_intermediate_steps = False
+intermediate_step_interval = 1
 
 output_path = os.path.join(
     os.path.dirname(config_path),
-    "generated_objs_from_partial"
+    "generated_npy_from_partial"
 )
 
 os.makedirs(output_path, exist_ok=True)
@@ -76,8 +79,11 @@ def create_seed_from_partial():
 
     if "partial" not in data.files:
         raise KeyError(f"El archivo no tiene partial: {data_path}")
+    if "surface" not in data.files:
+        raise KeyError(f"El archivo no tiene surface/original: {data_path}")
 
     partial = torch.tensor(data["partial"]).float()
+    original = torch.tensor(data["surface"]).float()
 
     embedding = np.load(embedding_path)
     translation = torch.tensor(embedding["translation"][:, :3]).float()
@@ -85,6 +91,7 @@ def create_seed_from_partial():
     # Igual que en TransitionShapenetDataset:
     # point_coord = point_coord + embedding['translation'][:, :3]
     partial = partial + translation
+    original = original + translation
 
     # Igual que en el repo:
     # state_coord = quantize(point_coord, voxel_size)
@@ -101,7 +108,25 @@ def create_seed_from_partial():
         device=device
     )
 
-    return s
+    return s, partial, original
+
+
+def save_sparse_coords_npy(sparse_tensor, file_path):
+    coords_np = sparse_tensor.C[:, 1:].detach().cpu().numpy().astype(np.int32)
+    np.save(file_path, coords_np)
+    print("Saved voxel coords:", file_path)
+
+
+def save_pointclouds_npy(pointcloud_dict, trial, prefix):
+    for sample_num, pointclouds in pointcloud_dict.items():
+        for batch_idx, pointcloud in enumerate(pointclouds):
+            pc_np = pointcloud.detach().cpu().numpy().astype(np.float32)
+            file_path = os.path.join(
+                output_path,
+                f"{file_id}_trial_{trial}_{prefix}_points_{sample_num}_{batch_idx}.npy"
+            )
+            np.save(file_path, pc_np)
+            print("Saved point cloud:", file_path)
 
 
 # =========================
@@ -113,15 +138,43 @@ print("data_path:", data_path)
 print("embedding_path:", embedding_path)
 print("num_steps:", num_steps)
 print("test_sample_nums:", test_sample_nums)
+print("save_intermediate_steps:", save_intermediate_steps)
+print("intermediate_step_interval:", intermediate_step_interval)
 
 with torch.no_grad():
 
     for trial in range(num_trials):
         print(f"\nTrial {trial}")
 
-        s = create_seed_from_partial()
+        s, seed_partial, original_surface = create_seed_from_partial()
 
         print(f"Initial voxels: {s.C.shape[0]}")
+
+        if partial_screenshot:
+            seed_path = os.path.join(
+                output_path,
+                f"{file_id}_trial_{trial}_seed_partial_points.npy"
+            )
+            np.save(seed_path, seed_partial.detach().cpu().numpy().astype(np.float32))
+            print("Saved initial seed point cloud:", seed_path)
+
+        original_path = os.path.join(
+            output_path,
+            f"{file_id}_trial_{trial}_original_surface_points.npy"
+        )
+        np.save(original_path, original_surface.detach().cpu().numpy().astype(np.float32))
+        print("Saved original object point cloud:", original_path)
+
+        if save_intermediate_steps:
+            intermediate_dir = os.path.join(
+                output_path,
+                f"{file_id}_trial_{trial}_intermediate_steps"
+            )
+            os.makedirs(intermediate_dir, exist_ok=True)
+            save_sparse_coords_npy(
+                s,
+                os.path.join(intermediate_dir, "step_000_seed_voxels.npy")
+            )
 
         for t in range(num_steps):
             s = model.transition(s)
@@ -129,33 +182,35 @@ with torch.no_grad():
             n_voxels = s.C.shape[0]
             print(f"    step {t + 1:02d}: {n_voxels} voxels")
 
+            if (
+                save_intermediate_steps
+                and intermediate_step_interval > 0
+                and (t + 1) % intermediate_step_interval == 0
+            ):
+                save_sparse_coords_npy(
+                    s,
+                    os.path.join(intermediate_dir, f"step_{t + 1:03d}_voxels.npy")
+                )
+
             if n_voxels > config.get("voxel_overflow", 20000):
                 print(f"  [WARNING] voxel overflow: {n_voxels}")
                 break
 
-        # Guardar voxeles finales
-        coords_np = s.C[:, 1:].detach().cpu().numpy().astype(np.int32)
-
-        np.savez_compressed(
-            os.path.join(output_path, f"{file_id}_trial_{trial}_voxels.npz"),
-            coord=coords_np,
-            voxel_size=np.array([voxel_size], dtype=np.float32)
+        save_sparse_coords_npy(
+            s,
+            os.path.join(output_path, f"{file_id}_trial_{trial}_final_voxels.npy")
         )
 
-        # Convertir a mesh / point cloud
-        s_pc_dict, mesh_dict = model.get_pointcloud(
+        if hasattr(model, 'apply_final_sampling_symmetry'):
+            s = model.apply_final_sampling_symmetry(s)
+
+        # Convertir a nube de puntos final sin exportar mallas OBJ.
+        s_pc_dict = model.get_pointcloud(
             s,
             test_sample_nums,
-            return_mesh=True
+            return_mesh=False
         )
 
-        for k, meshes in mesh_dict.items():
-            for batch_idx, mesh in enumerate(meshes):
-                file_path = os.path.join(
-                    output_path,
-                    f"{file_id}_trial_{trial}_{k}_{batch_idx}.obj"
-                )
-                mesh.export(file_path)
-                print("Saved mesh:", file_path)
+        save_pointclouds_npy(s_pc_dict, trial, "final")
 
 print("\nDone.")

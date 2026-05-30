@@ -25,6 +25,8 @@ from utils.visualization import (
 	sparse_tensors2tensor_imgs, save_tensor_img, tensors2tensor_imgs
 )
 
+from utils.symmetry import get_symmetry_config, make_symmetric_sparse_coords
+
 def change_feat(f):
 	def wrapper(*args):
 		data = f(*args)
@@ -45,6 +47,8 @@ class TransitionDataset(BaseDataset):
 		self.data_list = []
 
 	def cache(self, model, data, rel_file_names, step):
+		approach = self.config.get('approach', 'original')
+		symmetry_loss_config = get_symmetry_config(self.config)
 		batch_size = len(data['state_feat'])
 		s_init = SparseTensor(
 			features=torch.cat(data['state_feat']),
@@ -87,6 +91,20 @@ class TransitionDataset(BaseDataset):
 					s_next = model.transition(s, sigma)
 				s = s_next
 				phase += 1
+
+			if approach == 'symmetry_loss' and symmetry_loss_config['enabled'] and symmetry_loss_config['enforce_sampling'] and symmetry_loss_config['enforce_sampling_mode'] == 'final':
+				sym_coords, sym_feats = make_symmetric_sparse_coords(
+					s.C, s.F,
+					axis=symmetry_loss_config['axis'],
+					plane_value=symmetry_loss_config['plane_value'],
+					merge_features=symmetry_loss_config['merge_features'],
+					coordinate_layout='batched',
+					data_dim=self.config['data_dim']
+				)
+				s = SparseTensor(features=sym_feats, coordinates=sym_coords, device=self.device)
+
+			if hasattr(model, 'apply_final_sampling_symmetry'):
+				s = model.apply_final_sampling_symmetry(s)
 
 			out_imgs = sparse_tensors2tensor_imgs(
 				s, self.config['data_dim'],

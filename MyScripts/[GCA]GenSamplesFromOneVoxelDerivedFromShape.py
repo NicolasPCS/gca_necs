@@ -218,6 +218,9 @@ def main():
                 if n_voxels > voxel_overflow_limit:
                     print(f"  [WARNING] voxel overflow: {n_voxels}")
                     break
+            
+            if hasattr(model, 'apply_final_sampling_symmetry'):
+                s = model.apply_final_sampling_symmetry(s)
 
             pointcloud = extract_pointcloud(model, s, args.num_points)
             pc_path = os.path.join(output_path, f"generated_object_{object_idx:04d}_{shape_id}.npy")

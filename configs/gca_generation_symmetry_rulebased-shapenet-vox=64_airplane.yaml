@@ -162,7 +162,7 @@ test_save_mesh: False
 ############
 symmetry_rules:
   enabled: true
-  apply_during_training: true
+  apply_during_training: false
   apply_during_sampling: true
   debug: false
   metadata_key: symmetry

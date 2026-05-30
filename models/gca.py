@@ -13,7 +13,9 @@ from utils.visualization import (
 	vis_2d_coords, tensors2dist_func_tensor_imgs, tensors2tensor_imgs
 )
 from utils.marching_cube import marching_cubes_sparse_voxel
-from utils.symmetry_rules import *
+
+from utils.symmetry import (get_symmetry_config, compute_symmetry_occupancy_loss, make_symmetric_sparse_coords)
+from utils.symmetry_rules import (get_symmetry_rules_config, batch_specs_from_config, apply_symmetry_rule_to_batched_state)
 
 class GCA(TransitionModel):
 	name = 'gca'
@@ -22,6 +24,8 @@ class GCA(TransitionModel):
 		TransitionModel.__init__(self, config, writer)
 		self.infusion_scheduler = InfusionScheduler(config)
 		self.bce_loss = torch.nn.BCEWithLogitsLoss()
+		self.approach = config.get('approach', 'original')
+		self.symmetry_loss_config = get_symmetry_config(config)
 		self.symmetry_rules_config = get_symmetry_rules_config(config)
 
 	@timeit
@@ -120,20 +124,41 @@ class GCA(TransitionModel):
 				self.scalar_summaries[incomplete_key] = [self.scalar_summaries[incomplete_key][0] + 1] if \
 					len(self.scalar_summaries[incomplete_key]) != 0 else [1]
 
-		# NOTE: Symmetry rule during training
-		if self.symmetry_rules_config['enabled'] and self.symmetry_rules_config['apply_during_training']:
+		loss = torch.stack(losses).mean()
+		symmetry_loss = None
+
+		# NOTE: Loss-based symmetry during training
+		if self.approach == "symmetry_loss" and self.symmetry_loss_config['enabled'] and self.symmetry_loss_config['train_loss_weight'] > 0 and self.symmetry_loss_config['train_loss_type'] in ['occupancy', 'both']:
+			symmetry_loss = compute_symmetry_occupancy_loss(
+				s_hat.C,
+				s_hat.F[:, 0],
+				axis=self.symmetry_loss_config['axis'],
+				plane_value=self.symmetry_loss_config['plane_value'],
+				coordinate_layout='batched',
+				data_dim=self.config['data_dim']
+			)
+			loss = loss + self.symmetry_loss_config['train_loss_weight'] * symmetry_loss
+
+		# NOTE: Rule-based symmetry during training
+		if self.approach == 'symmetry_rules' and self.symmetry_rules_config['enabled'] and self.symmetry_rules_config['apply_during_training']:
 			# Convert per item unbatched coords [Ni, 3] to one batched tensor [N, 4].
 			s_next_batched = ME.utils.batched_coordinates(s_next_coords).to(self.device)
 			batch_specs = batch_specs_from_config(self.config, batch_size, data=data)
-			s_next_batched, _ = apply_symmetry_rule_to_batched_state(s_next_batched, feats=None, batch_specs=batch_specs, data_dim=self.config['data_dim'])
+			s_next_batched, _ = apply_symmetry_rule_to_batched_state(
+				s_next_batched, 
+				feats=None, 
+				batch_specs=batch_specs, 
+				data_dim=self.config['data_dim']
+			)
 			s_next_coords = [s_next_batched[s_next_batched[:, 0] == batch_idx, 1:].detach().cpu()
 							 for batch_idx in range(batch_size)] 
 
-		loss = torch.stack(losses).mean()
 		data['state_coord'] = s_next_coords
-
+		
 		# write summaries
 		self.scalar_summaries['loss/{}/total'.format(mode)] += [loss.item()]
+		if symmetry_loss is not None:
+			self.scalar_summaries['loss/{}/symmetry'.format(mode)] += [symmetry_loss.detach().cpu().item()]
 		self.list_summaries['loss/{}/total_histogram'.format(mode)] += torch.stack(losses).cpu().tolist()
 		self.scalar_summaries['num_points/input'] += [(s.C[:, 0] == i).sum().item() for i in range(batch_size)]
 		self.scalar_summaries['num_points/output'] += [one_hot_gt[i].shape[0] for i in range(batch_size)]
@@ -172,11 +197,28 @@ class GCA(TransitionModel):
 				else:
 					s_next_coord = torch.cat([s_next_coord, fallback_coord], dim=0)
 		
-		# NOTE: Symmetry rule during sampling
-		if self.symmetry_rules_config['enabled'] and self.symmetry_rules_config['apply_during_sampling']:
+		# NOTE: Loss-based symmetry during training
+		if self.approach == 'symmetry_loss' and self.symmetry_loss_config['enabled'] and self.symmetry_loss_config['enforce_sampling'] and self.symmetry_loss_config['enforce_sampling_mode'] == 'each_step':
+			s_next_coord, _ = make_symmetric_sparse_coords(
+				s_next_coord,
+				feats=None,
+				axis=self.symmetry_loss_config['axis'],
+				plane_value=self.symmetry_loss_config['plane_value'],
+				merge_features=self.symmetry_loss_config['merge_features'],
+				coordinate_layout='batched',
+				data_dim=self.config['data_dim']
+			)
+
+		# NOTE: Rule-based symmetry during training
+		if self.approach == 'symmetry_rules' and self.symmetry_rules_config['enabled'] and self.symmetry_rules_config['apply_during_sampling']:
 			batch_size = s.C[:, 0].max().item() + 1
 			batch_specs = batch_specs_from_config(self.config, batch_size)
-			s_next_coord, _ = apply_symmetry_rule_to_batched_state(s_next_coord, feats=None, batch_specs=batch_specs, data_dim=self.config['data_dim'])
+			s_next_coord, _ = apply_symmetry_rule_to_batched_state(
+				s_next_coord, 
+				feats=None, 
+				batch_specs=batch_specs, 
+				data_dim=self.config['data_dim']
+			)
 
 		s_next_feat = torch.ones(s_next_coord.shape[0], 1)
 		try:
@@ -187,6 +229,24 @@ class GCA(TransitionModel):
 		except RuntimeError:
 			breakpoint()
 		return s_next
+	
+	def apply_final_sampling_symmetry(self, s: SparseTensor):
+		if self.approach != 'symmetry_loss':
+			return s
+		
+		if not self.symmetry_loss_config['enabled'] and self.symmetry_loss_config['enforce_sampling'] and self.symmetry_loss_config['enforce_sampling_mode'] == 'final':
+			return s
+		
+		sym_coords, sym_feats = make_symmetric_sparse_coords(
+			s.C, s.F,
+			axis=self.symmetry_loss_config['axis'],
+			plane_value=self.symmetry_loss_config['plane_value'],
+			merge_features=self.symmetry_loss_config['merge_features'],
+			coordinate_layout='batched',
+			data_dim=self.config['data_dim']
+		)
+
+		return SparseTensor(features=sym_feats, coordinates=sym_coords, device=self.device)
 
 	def vis_collated_imgs(self, dataset, vis_indices: List, step: int):
 		training = self.training

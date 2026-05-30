@@ -31,7 +31,7 @@ parser.add_argument('--resume-ckpt')
 parser.add_argument('--resume-latest-ckpt')
 parser.add_argument('--override', default='')
 parser.add_argument('--test', default=False, action='store_true')
-
+parser.add_argument('--approach', default='original', choices=['original', 'symmetry_loss', 'symmetry_rules'], help="GCA variant: original, symmetry_loss, symmetry_rules.")
 
 def main():
 	args = parser.parse_args()
@@ -68,6 +68,9 @@ def main():
 			raise ValueError('{} is not defined in config file. '
 							 'Failed to override.'.format(address))
 		here[keys[-1]] = yaml.load(value, Loader=yaml.FullLoader)
+
+	config['approach'] = args.approach
+	print('Using approach={}'.format(config['approach']))
 
 	# Set log directory
 	config['log_dir'] = args.log_dir

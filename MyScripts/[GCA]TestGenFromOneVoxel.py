@@ -33,6 +33,40 @@ def create_single_voxel_seed(in_channels: int, device: torch.device) -> ME.Spars
     return ME.SparseTensor(features=feats, coordinates=coords, device=device)
 
 
+def make_visible_point_marker(center: np.ndarray, radius: float) -> np.ndarray:
+    """Create a tiny cross marker so a single seed point is visible in viewers."""
+    offsets = np.array([
+        [0.0, 0.0, 0.0],
+        [radius, 0.0, 0.0],
+        [-radius, 0.0, 0.0],
+        [0.0, radius, 0.0],
+        [0.0, -radius, 0.0],
+        [0.0, 0.0, radius],
+        [0.0, 0.0, -radius],
+    ], dtype=np.float32)
+    return center.reshape(1, 3).astype(np.float32) + offsets
+
+
+def save_initial_voxel_pointcloud(
+        output_dir: str,
+        in_channels: int,
+        device: torch.device,
+        voxel_size: float,
+) -> Tuple[str, str]:
+    """Save the exact seed point and a small visible marker for screenshot tools."""
+    seed = create_single_voxel_seed(in_channels, device)
+    if seed.C.shape[0] == 0:
+        pointcloud = np.zeros((1, 3), dtype=np.float32)
+    else:
+        pointcloud = seed.C[:1, 1:].detach().cpu().numpy().astype(np.float32) * voxel_size
+
+    point_path = os.path.join(output_dir, "initial_voxel_seed_points.npy")
+    marker_path = os.path.join(output_dir, "initial_voxel_seed_marker.npy")
+    np.save(point_path, pointcloud)
+    np.save(marker_path, make_visible_point_marker(pointcloud[0], radius=voxel_size))
+    return point_path, marker_path
+
+
 def run_ca_generation(
         model,
         in_channels: int,
@@ -51,6 +85,10 @@ def run_ca_generation(
                 f"{n_voxels} > {voxel_overflow_limit}. Stopping this trial."
             )
             break
+        
+    if hasattr(model, 'apply_final_sampling_symmetry'):
+        s = model.apply_final_sampling_symmetry(s)
+    
     return s
 
 
@@ -99,6 +137,11 @@ def parse_args():
         action="store_true",
         help="Enable trial-based generation and keep the point cloud with lowest symmetry Chamfer. Disabled by default.",
     )
+    parser.add_argument(
+        "--save-initial-voxel-pointcloud",
+        action="store_true",
+        help="Save the one-voxel seed as initial_voxel_seed_points.npy. Disabled by default.",
+    )
     parser.add_argument("--output-subdir", default=None)
     return parser.parse_args()
 
@@ -130,7 +173,18 @@ def main():
 
     num_steps = args.num_steps if args.num_steps is not None else config.get("max_eval_steps", config.get("max_phase", 30))
     in_channels = config["backbone"].get("in_channels", 1)
+    voxel_size = config["voxel_size"]
     voxel_overflow_limit = config.get("voxel_overflow", 20000)
+
+    if args.save_initial_voxel_pointcloud:
+        seed_path, marker_path = save_initial_voxel_pointcloud(
+            output_dir=output_dir,
+            in_channels=in_channels,
+            device=device,
+            voxel_size=voxel_size,
+        )
+        print(f"Initial voxel point cloud saved in: {seed_path} with shape (1, 3)")
+        print(f"Visible initial voxel marker saved in: {marker_path} with shape (7, 3)")
 
     if not args.use_trials:
         print(f"Generating {args.num_objects} objects without trials.")
